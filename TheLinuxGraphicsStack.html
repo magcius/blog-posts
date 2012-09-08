@@ -21,7 +21,7 @@ To start us off, I'm going to paste the entire big stack right here, to let you 
 <dd><ul>
 <li>Your program starts up, using cairo to draw.</li>
 <li>You draw some circles using a gradient. cairo decomposes the circles into trapezoids, and sends these trapezoids and gradients to the X server using the XRender extension. In the case where the X server doesn't support the XRender extension, cairo draws locally using libpixman, and uses some other method to send the rendered pixmap to the X server.</li>
-<li>The X server acknowledges the XRender request. Xorg can use multiple specialized drivers to the drawing.<ol>
+<li>The X server acknowledges the XRender request. Xorg can use multiple specialized drivers to do the drawing.<ol>
 <li>In a software fallback case, or in the case the graphics driver isn't up to the task, Xorg will use pixman to do the actual drawing, similar to how cairo does it in its case.</li>
 <li>In a hardware-accelerated case, the Xorg driver will speak libdrm to the kernel, and send textures and commands to the card in the same way.</li></ol></li>
 </ol></dd>
