@@ -1,0 +1,203 @@
+This is an introductory overview post for the Linux Graphics Stack, and how it currently all fits together. I initially wrote it for myself after having conversations with people like Owen Taylor, Ray Strode and Adam Jackson about this stack. I had to go back to them every month or so and learn the stuff from the ground up all over again, as I had forgotten every single piece. I asked them for a good high-level overview document so I could stop bothering them. They didn't know of any. I started this one. It has been reviewed by Adam Jackson and David Airlie, both of whom work on this exact stack.
+
+Also, I want to point out that a large amount of this stack applies only to the free software drivers. That means that a lot of what you read here may not apply for the AMD Catalyst and NVidia proprietary drivers. They may have their own implementations of OpenGL, or an internal fork of mesa. I'm describing the stack that comes with the free radeon, nouveau and Intel drivers.
+
+If you have any questions, or if at any point things were unclear, or if I'm horribly, horribly wrong about something, or if I just botched a sentence so that it's incomprehensible, please ask me or let me know in the comments section below.
+
+To start us off, I'm going to paste the entire big stack right here, to let you get a broad overview of where every piece fits in the stack. If you do not understand this right away, don't be scared. Feel free to refer to this throughout the post. <a href="#rendering-stack">Here's a handy link</a>.
+
+<p id="rendering-stack">So, to be precise, there are two different paths, depending on the type of rendering you're doing.</p>
+
+<dl>
+<dt>3D rendering with OpenGL</dt>
+<dd><ol>
+<li>Your program starts up, using "OpenGL" to draw.</li>
+<li>A library, "mesa", implements the OpenGL API. It uses card-specific drivers to translate the API into a hardware-specific form. If the driver uses Gallium internally, there's a shared component that turns the OpenGL API into a common intermediate representation, TGSI. The API is passed through Gallium, and all the device-specific driver does is translate from TGSI into hardware commands,</li>
+<li>libdrm uses special secret card-specific <code>ioctl</code>s to talk to the Linux kernel</li>
+<li>The Linux kernel, having special permissions, can allocate memory on and for the card.</li>
+<li>Back out at the mesa level, mesa uses DRI2 to talk to Xorg to make sure that buffer flips and window positions, etc. are synchronized.</li></ol></dd>
+
+<dt>2D rendering with cairo</dt>
+<dd><ul>
+<li>Your program starts up, using cairo to draw.</li>
+<li>You draw some circles using a gradient. cairo decomposes the circles into trapezoids, and sends these trapezoids and gradients to the X server using the XRender extension. In the case where the X server doesn't support the XRender extension, cairo draws locally using libpixman, and uses some other method to send the rendered pixmap to the X server.</li>
+<li>The X server acknowledges the XRender request. Xorg can use multiple specialized drivers to the drawing.<ol>
+<li>In a software fallback case, or in the case the graphics driver isn't up to the task, Xorg will use pixman to do the actual drawing, similar to how cairo does it in its case.</li>
+<li>In a hardware-accelerated case, the Xorg driver will speak libdrm to the kernel, and send textures and commands to the card in the same way.</li></ol></li>
+</ol></dd>
+</dl>
+
+As to how Xorg gets things on the screen, Xorg itself will set up a framebuffer to draw into using KMS and card-specific drivers.
+
+<h2>X Window System, X11, Xlib, Xorg</h2>
+
+X11 isn't just related to graphics; it has an event delivery system, the concept of properties attached to windows, and more. Lots of other non-graphical things are built on top of it (clipboard, drag and drop). Only listed in here for completeness, and as an introduction. I'll try and post about the entire X Window System, X11 and all its strange design decisions later.
+
+<dl>
+<dt>X11</dt>
+<dd>The wire protocol used by the X Window System</dd>
+<dt>Xlib</dt>
+<dd>The reference implementation of the client side of the system, and a host of tons of other utilities to manage windows on the X Window System. Used by toolkits with support for X, like GTK+ and Qt. Vanishingly rare to see in applications today.</dd>
+<dt>XCB</dt>
+<dd>Sometimes quoted as an alternative to Xlib. It implements a large amount of the X11 protocol. Its API is at a much lower level than Xlib, such that Xlib is actually built on XCB nowadays. Only mentioning it because it's another acronym.</dd>
+<dt>Xorg</dt>
+<dd>The reference implementation of the server side of the system.</dd>
+</dl>
+
+<p style="border: 1px solid #bbb; background-color: #eee; color: black; padding: 1em;">As I'll try to be very careful to label something correctly. If I say "the X server", I'm talking about a generic X server: it may be Xorg, it may be Apple's X server implementation, it may be Kdrive. We don't know. If I say "X11", or the "X Window System", I'm talking about the design of the protocol or system overall. If I say "Xorg", that means that it's an implementation detail of Xorg, which is the most used X server, and may not apply to any other X servers at all. If I ever say "X" by itself, it's a bug.</p>
+
+X11, the protocol, was designed to be extensible, which means that support for new features can be added without creating a new protocol and breaking existing old clients. As an example, <code>xeyes</code> and <code>oclock</code> get their fancy shapes because of the <a href="http://www.x.org/releases/X11R7.7/doc/libXext/shapelib.txt">Shape Extension</a>, which provide support for non-rectangular windows. If you're curious how this magic functionality can just appear out of nowhere, the answer is that it doesn't: support for the extension has to be added to both the server and client before it can be used. There is functionality in the core protocol itself so that clients can ask the server what extensions it has support for, so it knows what functionality it can or cannot use.
+
+X11 was also designed to be "network transparent". Most importantly it means that we cannot rely on the X server and any X client being on the same machine, so any talking between the two must go over the network. In actuality, a modern desktop environment does not work out of the box in this scenario, as a lot of inter-process communication goes through systems other than X11, like DBus. Over the network, it's quite chatty, and results in a lot of traffic. When the server and client are on the same machine, instead of going over the network, they'll go over a UNIX socket, and the kernel doesn't have to copy data around.
+
+We'll get back to the X Window System and its numerous extensions in a little bit.
+
+<h2>cairo</h2>
+
+<b>cairo</b> is a drawing library used either by applications like Firefox directly, or through libraries like GTK+, to draw vector shapes. GTK+3's drawing model is built entirely on cairo. If you've ever used an HTML5 <code>&lt;canvas&gt;</code>, cairo implements pratically the same API. Although <code>&lt;canvas&gt;</code> was originally developed by Apple, the vector drawing model is well-known, as it's the PostScript vector drawing model, which has found support in other vector graphics technologies and standards such as PDF, Flash, SVG, Direct2D, Quartz 2D, OpenVG, and lots more than I can possibly give an exhaustive list for.
+
+cairo has support to draw to X11 surfaces through the <a href="http://cairographics.org/manual/cairo-XLib-Surfaces.html">Xlib backend</a>.
+
+cairo has been used in toolkits like GTK+. Functionality was added in GTK+ 2 to optionally use cairo in GTK+ 2.8. The drawing model in GTK+3 requires cairo.
+
+<h2>XRender Extension</h2>
+
+X11 has a special extension, <b>XRender</b>, which adds support for anti-aliased drawing primitives (X11's existing graphics were aliased), gradients, matrix transforms and more. The original intention was that drivers could have specialized accelerated code paths for doing specific drawing. Unfortunately, it seems to be the case that <a href="http://ickle.wordpress.com/">software rasterization is just as fast</a>, for unintuitive reasons. Oh well. XRender deals in aligned trapezoids - rectangles with an optional slant to the left and right edges. Carl Worth and Keith Packard came up with a "fast" software rasterization method for trapezoids. Trapezoids are also super easy to decompose into two triangles, to align ourselves with fast hardware rendering. Cairo includes a wonderful <code>show-traps</code> utility that might give you a bit of insight into the tesselation into trapezoids it does.
+
+<a href="http://blog.mecheye.net/wp-content/uploads/traps2.png"><img src="http://blog.mecheye.net/wp-content/uploads/traps2.png" alt="" title="traps1" width="42" height="83" class="aligncenter size-medium wp-image-177" /></a>
+
+Here's a simple red circle we drew. This is decomposed into two sets of trapezoids - one for the stroke, and one for the fill. Since the diagrams that <code>show-traps</code> gives you by default aren't very enlightening, I hacked up the utility to give each trapezoid a unique color. Here's the set of trapezoids for the black stroke.
+
+<a href="http://blog.mecheye.net/wp-content/uploads/traps2decomp2.png"><img src="http://blog.mecheye.net/wp-content/uploads/traps2decomp2-282x300.png" alt="" title="traps2decomp2" width="282" height="300" class="aligncenter size-medium wp-image-198" /></a>
+
+Psychedelic.
+
+<h2>pixman</h2>
+
+Both the X server and cairo need to do pixel level manipulation at some point. cairo and Xorg had separate implementations of things like basic rasterization algorithms, pixel-level access for certain kinds of buffers (ARGB32, RGB24, RGB565), gradients, matrices, and a lot more. Now, both the X server and cairo share a low-level library called <b>pixman</b>, which handles these things for it. pixman is not supposed to be a public API, nor is it a drawing API. It's not really any API at all; it's just a solution to some code duplication between various parts.
+
+<h2>OpenGL, mesa, gallium</h2>
+
+Now comes the fun part: modern hardware acceleration. I assume everybody already knows what OpenGL is. It's not a library, there will never be one set of sources to a <code>libGL.so</code>. Each vendor is supposed to provide its own <code>libGL.so</code>. nVidia provides its own implementation of OpenGL and ships its own <code>libGL.so</code>, based on its implementations for Windows and OS X.
+
+If you are running open-source drivers, your <code>libGL.so</code> implementation probably comes from <b>mesa</b>. <b>mesa</b> is many things, but one of the major things it provides that it is most famous for is its OpenGL implementation. It is an open-source implementation of the OpenGL API. mesa itself has multiple backends for which it provides support. It has three CPU-based implementations: swrast (outdated and old, do not use it), softpipe (slow), llvmpipe (potentially fast). <code>mesa</code> also has hardware-specific drivers. Intel supports mesa and has built a number of drivers for their chipsets which are shipped inside mesa. The radeon and nouveau drivers are also supported in mesa, but are built on a different architecture: gallium.
+
+<b>gallium</b> isn't really anything magical. It's a set of components to make implementing drivers a lot easier. The idea is that there are state trackers that implement some form of API (OpenGL, GLSL, Direct3D), transform that state to an intermediate representation (known as <a href="http://people.freedesktop.org/~csimpson/gallium-docs/tgsi.html">Tungsten Graphics Shader Infrastructure, or TGSI</a>), and then the backends take that intermediate representation and convert it to the operations that would be consumed by the hardware itself.
+
+Sadly, the Intel drivers don't use Gallium. My coworkers tell me it's because the Intel driver developers do not like having a layer between Mesa and their driver.
+
+<h2>A quick aside: more acronyms</h2>
+
+Since there's a lot of confusing acronyms to cover, and I don't want to give them each an H3 and write a paragraph for each, I'm just going to list them here. Most of them don't really matter in today's world, they're just an easy reference so you don't get confused.
+
+<dl>
+<dt>GLES</dt>
+<dd>OpenGL has several profiles for different form factors. <b>GLES</b> is one of them, standing for "GL Embedded System" or "GL Embedded Subset", depending on who you ask. It's the latest approach to target the embedded market. The iPhone supports GLES 2.0.</dd>
+
+<dt>GLX</dt>
+<dd>OpenGL has no concept of platform and window systems on its own. Thus, bindings are needed to translate between the differences of OpenGL and something like X11. For instance, putting an OpenGL scene inside an X11 window. <b>GLX</b> is this glue.</dd>
+
+<dt>WGL</dt>
+<dd>See above, but replace "X11" with "Windows", that is, that one Microsoft Operating System.</dd>
+
+<dt>EGL</dt>
+<dd>EGL and GLES are often confused. <b>EGL</b> is a new platform-agnostic API, developed by Khronos Group (the same group that develops and standardizes OpenGL) that provides facilities to get an OpenGL scene up and running on a platform. Like OpenGL, this is vendor-implemented; it's an alternative to bindings like WGL/GLX and not just a library on top of them, like GLUT.</dd>
+
+<dt>fglrx</dt>
+<dd><b>fglrx</b> is former name for AMD's proprietary Xorg OpenGL driver, now known as "Catalyst". It stands for "FireGL and Radeon for X". Since it is a proprietary driver, it has its own implemnetation of <code>libGL.so</code>. I do not know if it is based on mesa. I'm only mentioning it because it's sometimes confused with generic technology like AIGLX or GLX, due to the appearance of the letters "GL" and "X".</dd>
+
+<dt>DIX, DDX</dt>
+<dd>The X graphics parts of Xorg is made up of two major parts, <code>DIX</code>, the "Driver Independent X" subsystem, and <code>DDX</code>, the "Driver Dependent X" subsystem. When we talk about an Xorg driver, the more technically accurate term is a DDX driver.</dd>
+</dl>
+
+<h2>Xorg Drivers, DRM, DRI</h2>
+
+A little while back I mentioned that Xorg has the ability to do accelerated rendering, based on specific pieces of hardware. I'll also say that this is not implemented by translating from X11 drawing commands into OpenGL calls. If the drivers are implemented in mesa land, how can this work without making Xorg dependent on mesa?
+
+The answer was to create a new piece of infrastructure to be shared between mesa and Xorg. mesa implements the OpenGL parts, Xorg implements the X11 drawing parts, and they both convert to a set of card-specific commands. These commands are then uploaded to the kernel, using something called the "Direct Rendering Manager", or <b>DRM</b>. libdrm uses a set of generic, private <code>ioctl</code>s with the kernel to allocate things on the card, and stuffs the commands and textures and things it needs in there. This <code>ioctl</code> interface comes in two forms: Intel's <b>GEM</b>, and Tungsten Graphics's <b>TTM</b>. There is no good distinction between them; they both do the same thing, they're just different competing implementation. Historically, GEM was designed and proudly announced to be a simpler alternative to TTM, but over time, it has quietly grown to about the same complexity as TTM. Welp.
+
+This means that when you run something like <code>glxgears</code>, it loads mesa. mesa itself loads libdrm, and that talks to the kernel driver directly using GEM/TTM. Yes, <code>glxgears</code> talks to the kernel driver directly to show you some spinning gears, and sternly remind you of the benchmarking contents of said utility.
+
+If you poke in <code>ls /usr/lib64/libdrm_*</code>, you'll note that there are hardware-specific drivers. For cases when GEM/TTM aren't enough, the mesa and X server drivers will have a set of private <code>ioctl</code>s to talk to the kernel, which are encapsulated in here. libdrm itself doesn't actually load these.
+
+The X server needs to know what's happening here, though, so it can do things like synchronization. This synchronization between your <code>glxgears</code>, the kernel, and the X server is called <b>DRI</b>, or more accurately, DRI2. "DRI" stands for "Direct Rendering Infrastructure", but it's sort of a strange acronym. "DRI" refers to both the project that glued mesa and Xorg together (introducing DRM and a bunch of the things I talk about in this article), as well as the DRI protocol and library. DRI 1 wasn't really that good, so we threw it out and replaced it with DRI 2.
+
+<h2>KMS</h2>
+
+As a sort of aside, let's say you're working on a new X server, or maybe you want to show graphics on a VT without using an X server. How do you do it? You have to configure the actual hardware to be able to put up graphics. Inside of libdrm and the kernel, there's a special subsystem that does exactly that, called <b>KMS</b>, which stands for "Kernel Mode Setting". Again, through a set of <code>ioctl</code>s, it's possible to set up a graphics mode, map a framebuffer, and so on, to display directly on a TTY. Before, there were (and still are) hardware-specific <code>ioctl</code>s, so a shared library called libkms was created to give a shared API. Eventually, there was a new API at the kernel level, literally called the "dumb <code>ioctl</code>s". With the new dumb <code>ioctl</code>s in place, it is recommended to use those and not libkms.
+
+While it's very low-level, it's entirely possible to do. Plymouth, the boot splash screen integrated into modern distributions, is a good example of a very simple application that does this to set up graphics without relying on an X server.
+
+<h2>The "Expose" model, Redirection, TFP, Compositing, AIGLX</h2>
+
+I've used the term "compositing window manager" without really describing what it means to composite, or what a window manager does. You see, back in the 80s when the X Window System was designed on UNIX systems, a lot of random other companies like HP, Digital Equipment Corp., Sun Microsystems, SGI, were also developing products based on the X Window System. X11 intentionally didn't mandate any basic policy on how windows were to be controlled, and delegated that responsibility to a separate process called the "window manager".
+
+As an example, the popular environment at the time, CDE, had a system called "focus follows mouse", which focused windows when the user moved their mouse over the window itself. This is different from the more popular model that Windows and Mac OS X use by default, "click to focus".
+
+As window managers started to become more and more complex, <a href="http://tronche.com/gui/x/icccm/">documents</a> started to <a href="http://standards.freedesktop.org/wm-spec/">appear</a> describing interoperability between the many different environments. It, too, wouldn't really mandate any policy either like "Click to Focus" either.
+
+Additionally, back in the 80s, many systems did not have much memory. They could not store the entire pixel contents of all window contents. Windows and X11 solve this issue in the same way: each X11 window should be lossy. Namely, a program will be notified that a window has been "exposed".
+
+<a href="http://blog.mecheye.net/wp-content/uploads/Diagram1.png"><img src="http://blog.mecheye.net/wp-content/uploads/Diagram1-300x300.png" alt="" title="Diagram1" width="300" height="300" class="aligncenter size-medium wp-image-231" /></a>
+
+Imagine a set of windows like this. Now let's say the user drags GIMP away:
+
+<a href="http://blog.mecheye.net/wp-content/uploads/Diagram2.png"><img src="http://blog.mecheye.net/wp-content/uploads/Diagram2-300x300.png" alt="" title="Diagram2" width="300" height="300" class="aligncenter size-medium wp-image-232" /></a>
+
+The area in the dark gray has been exposed. An <code>ExposeEvent</code> will get sent to the program that owns the window, and it will have to redraw contents. This is why hung programs in versions of Windows or Linux would go blank after you dragged a window over them. Consider the fact that in Windows, the desktop itself is just another program without any special privileges, and can hang like all the others, and you have <a href="http://mrdoob.com/lab/javascript/effects/ie6/">one hell of a bug report</a>.
+
+So, now that machines have as much memory as they do, we have the opportunity to make X11 windows <i>lossless</i>, by a mechanism called <b>redirection</b>. When we redirect a window, the X server will create backing pixmaps for each window, instead of drawing directly to the backbuffer. This means that the window will be hidden entirely. Something <i>else</i> has to take the opportunity to display the pixels in the memory buffer.
+
+The <a href="http://www.x.org/releases/X11R7.7/doc/compositeproto/compositeproto.txt">composite extension</a> allows a compositing window manager, or "compositor", to set up something called the <b>Composite Overlay Window</b>, or <b>COW</b>. The compositor owns the COW, and can paint to it. When you run Compiz or GNOME Shell, these programs are using OpenGL to display the redirected windows on the screen. The X server can give them the window contents by a GL extension, "<b><a href="http://www.opengl.org/registry/specs/EXT/texture_from_pixmap.txt">Texture from Pixmap</a></b>", or <b>TFP</b>. It lets an OpenGL program use an X11 Pixmap as if it were an OpenGL Texture.
+
+Compositing window managers don't <i>have</i> to use TFP or OpenGL, per se, it's just the easiest way to do so. They could, if they wanted to, draw the window pixmaps onto the COW normally. I've been told that <code>kwin4</code> uses Qt directly to composite windows.
+
+Compositing window managers grab the pixmap from the X server using TFP, and then render it on to the OpenGL scene at just the right place, giving the illusion that the thing that you think you're clicking on is the actual X11 window. It may sound silly to describe this as an illusion, but play around with GNOME Shell and adjust the size or position of the window actors (Enter <code>global.get_window_actors().forEach(function(w) { w.scale_x = w.scale_y = 0.5; })</code> in the looking glass), and you'll quickly see the illusion break down in front of you, as you realize that when you click, you're poking straight through the video player, and to the actual window underneath (Change <code>0.5</code> to <code>1.0</code> in the above snippet to revert the behavior).
+
+With this information, let's explain one more acronym: <b>AIGLX</b>. AIGLX stands for "Accelerated Indirect GLX". As X11 is a networked protocol, this means that OpenGL should have to work over the network. When OpenGL is being used over the network, this is called an "indirect context", versus a "direct context" where things are on the same machine. The network protocol used in an "indirect context' is fairly incomplete and unstable.
+
+To understand the design decision behind AIGLX, you have to understand the problem that it was trying to solve: making compositing window managers like Compiz fast. While nvidia's proprietary driver had kernel-level memory manangement through a custom interface, the open-source stack at this point hadn't achieved that yet. Pulling a window texture from the X server into the graphics hardware would have meant that it would have to be copied every time the window was updated. Slow. As such, AIGLX was a temporary hack to implement OpenGL in software, preventing the copy into hardware acceleration. As the scene that compositors like Compiz used wasn't very complex, it worked well enough.
+
+Despite all the fanfare and Phoronix articles, AIGLX hasn't been used realistically for a while, as we now have the entire DRI stack which can be used to implement TFP without a copy.
+
+As you can imagine, copying (or more accurately, sampling) the window texture contents so that it can be painted as an OpenGL texture requires copying data. As such, most window managers have a feature to turn redirection off for a window that's full-screen. It may sound a bit silly to describe this as <b>unredirection</b>, as that's the initial state a window is in. But while it may be the initial state for a window, with our modern Linux desktops, it's hardly the usual state. The logic here is that if a window would be covering the COW anyway and compositing features aren't necessary, it can safely be unredirected. This feature is designed to give high performance to programs like games, which need to run with high performance at 60 frames per second.
+
+<h2>Wayland</h2>
+
+As you can see, we've split out quite a large bit of the original infrastructure from X's initial monolithic behavior. This isn't the only place where we've tore down the monolithic parts of X: a lot of the input device handling has moved into the kernel with evdev, and things like device hotplug support has been moved back into udev.
+
+A large reason that the X Window System stuck around for now was just because it was a lot of effort to replace it. With Xorg stripped down from what it initially was, and with a large amount of functionality required for a modern desktop environment provided solely by extensions, well, how can I say this, <a href="https://www.xkcd.com/963/">X is overdue</a>.
+
+Enter Wayland. Wayland reuses a lot of existing infrastructure that we've built up. One of the most controversial things about it is that it lacks any sort of network transparency or drawing protocol. X's network transparency falls flat in modern times. A large amount of Linux features are hosted in places like DBus, not X, and it's a shame to see things like Drag and Drop and Clipboard support being by and large hacks with the X Window System solely for network support.
+
+Wayland can use almost the entire stack as detailed above to get a framebuffer on your monitor up and running. Wayland still has a protocol, but it's based around UNIX sockets and local resources. The biggest drastic change is that there is no <code>/usr/bin/wayland</code> binary running like there is a <code>/usr/bin/Xorg</code>. Instead, Wayland follows the modern desktop's advice and moves all of this into the window manager process instead. These window managers, more accurately called "compositors" in Wayland terms, are actually in charge of pulling events from the kernel with a system like evdev, setting up a frame buffer using KMS and DRM, and displaying windows on the screen with whatever drawing stack they want, including OpenGL. While this may sound like a lot of code, since these subsystems have moved elsewhere, code to do all of these things would probably be on the order of 2000-3000 SLOC. Consider that the portion of mutter just to implement a sane window focus and stacking policy and synchronize it with the X server is around 4000-5000 SLOC, and maybe you'll understand my fascination a bit more.
+
+While Wayland does have a library that implementations of both clients and compositors probably should use, it's simply a reference implementation of the specified Wayland protocol. Somebody could write a Wayland compositor entirely in Python or Ruby and implement the protocol in pure Python, without the help of a libwayland.
+
+Wayland clients talk to the compositor and request a buffer. The compositor will hand them back a buffer that they can draw into, using OpenGL, cairo, or whatever. The compositor is at the discretion to do whatever it wants with that buffer - display it normally because it's awesome, set it on fire because the application is being annoying, or spin it on a cube because we need more YouTube videos of Linux cube spinning.
+
+The compositor is also in control of input and event handling. If you tried out the thing with setting the scale of the windows in GNOME Shell above, you may have been confused at first, and then figured out that your mouse corresponded to the untransformed window. This is because we weren't *actually* affecting the X11 window itself, just changing how it gets displayed. The X server keeps track of where windows are, and it's up to the compositing window manager to display them where the X server thinks it is, otherwise, confusion happens.
+
+Since a Wayland compositor is in charge of reading from evdev and giving windows events, it probably has a much better idea of where a window is, and can do the transformations internally, meaning that not only can we spin windows on a cube temporarily, we will be able to <i>interact</i> with windows on a cube.
+
+<h2>Summary</h2>
+
+I still hear a lot today that Xorg is very monolithic in its implementation. While this is very true, it's less true than it was a long while ago. This isn't due to the incompetence on the part of Xorg developers, a large amount of this is due to baggage that we just have to support, like the hardware-accelerated XRender protocol, or going back even further, non-anti-aliased drawing commands like <code>XPolyFill</code>. While it's very apparent that X is going to go away in favor of Wayland some time soon, I want to make it clear that a lot of this is happening with the acknowledgement and help of the Xorg and desktop developers. They're not stubborn, and they're not incompetent. Hell, for dealing with and implementing a 30-year-old protocol plus history, they're doing an excellent job, especially with the new architecture.
+
+I also want to give a big shout-out to everybody who worked on the stuff I mentioned in this article, and also want to give my personal thanks to Owen Taylor, Ray Strode and Adam Jackson for being extremely patient and answering all my dumb questions, and to Dave Airlie and Adam Jackson for helping me technically review this article.
+
+While I went into some level of detail in each of these pieces, there's a lot more here where you could study in a lot more detail if it interests you. To pick just a few examples, you could study the the geometry algorithms and theories that cairo exploits to convert arbitrary shapes to trapezoids. Or maybe the fast software rendering algorithm for trapezoids by Carl Worth and Keith Packard and investigate why it's fast. Consider looking at the design of DRI2, and how it differs from DRI1. Or maybe you're interested in the hardware itself, and looking at graphics card architecture, and looking at the data sheets to see how you would program one. And if you want to help out in any of these areas, I assume all the projects listed above would be more than happy to have contributions.
+
+I'm planning on writing more of these in the future. A large amount of the stacks used in the Linux and GNOME community today don't have a good overview document detailing them from a very high level.
+
+<h3>Version History</h3>
+<ul>
+<li>Published</li>
+<li>Converted CSS-based diagrams to images to make it easier for Planet GNOME readers</li>
+<li>Fixed Looking Glass example line</li>
+<li>Fixed TFP link</li>
+<li>Modified the tone of the policy of window managers section to better convey the point</li>
+<li>Corrected information about GTK+ and cairo integration (GTK+ 2.8, not "near the end of the cycle")</li>
+<li>Fixed acronym expansion for "fglrx"</li>
+</ul>
+
